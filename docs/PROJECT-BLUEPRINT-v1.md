@@ -483,6 +483,872 @@ CREATE TABLE articles (
     day_of_week VARCHAR(20),
     day_color VARCHAR(7),
     month_flower VARCHAR(100),
+    is_evergreen BOOLEAN DEFAULT false,
+    reading_time_minutes INTEGER,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft',
+    published_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT now(),
+    updated_at TIMESTAMP DEFAULT now()
+);
 ```
 
-*[DOCUMENTO INCOMPLETO — Continuación pendiente]*
+### Tags (Etiquetas)
+
+```sql
+CREATE TABLE tags (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(100) UNIQUE NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE TABLE article_tags (
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    tag_id UUID REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (article_id, tag_id)
+);
+```
+
+### References (Fuentes y Citas)
+
+```sql
+CREATE TABLE article_references (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    citation_text TEXT NOT NULL,
+    source_url TEXT,
+    source_name VARCHAR(255),
+    continent VARCHAR(50),
+    order_index INTEGER,
+    created_at TIMESTAMP DEFAULT now()
+);
+```
+
+### Publication Schedule (Horario de Publicación)
+
+```sql
+CREATE TABLE publication_schedule (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    publish_date DATE NOT NULL,
+    publish_time TIME,
+    social_media_scheduled BOOLEAN DEFAULT false,
+    newsletter_scheduled BOOLEAN DEFAULT false,
+    created_at TIMESTAMP DEFAULT now(),
+    updated_at TIMESTAMP DEFAULT now()
+);
+```
+
+### Feedback (Retroalimentación)
+
+```sql
+CREATE TABLE feedback (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id),
+    comment TEXT,
+    rating INTEGER CHECK (rating >= 1 AND rating <= 5),
+    created_at TIMESTAMP DEFAULT now()
+);
+```
+
+### Comments (Comentarios)
+
+```sql
+CREATE TABLE comments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id),
+    parent_id UUID REFERENCES comments(id),
+    content TEXT NOT NULL,
+    is_approved BOOLEAN DEFAULT false,
+    created_at TIMESTAMP DEFAULT now(),
+    updated_at TIMESTAMP DEFAULT now()
+);
+```
+
+### User Interactions (Interacciones)
+
+```sql
+CREATE TABLE favorites (
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT now(),
+    PRIMARY KEY (user_id, article_id)
+);
+
+CREATE TABLE reading_history (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    read_at TIMESTAMP DEFAULT now(),
+    reading_duration_seconds INTEGER
+);
+
+CREATE TABLE subscriptions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    plan_name VARCHAR(50) NOT NULL,
+    start_date DATE NOT NULL,
+    end_date DATE,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT now()
+);
+```
+
+## Relaciones (Diagrama ER)
+
+```
+Users ──┬── 1:N ──→ Articles
+        ├── 1:N ──→ Comments
+        ├── 1:N ──→ Feedback
+        ├── N:N ──→ Favorites ←── Articles
+        └── 1:N ──→ Subscriptions
+
+Categories ── 1:N ──→ Articles
+
+Articles ──┬── 1:N ──→ Comments
+           ├── 1:N ──→ Feedback
+           ├── 1:N ──→ Article_References
+           ├── N:N ──→ Article_Tags ←── Tags
+           └── 1:1 ──→ Publication_Schedule
+```
+
+## Row Level Security (RLS)
+
+```sql
+ALTER TABLE articles ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Public read published" ON articles
+    FOR SELECT USING (status = 'published');
+
+CREATE POLICY "Editors can insert" ON articles
+    FOR INSERT WITH CHECK (auth.role() IN ('editor', 'admin'));
+
+CREATE POLICY "Editors can update" ON articles
+    FOR UPDATE USING (auth.role() IN ('editor', 'admin'));
+
+CREATE POLICY "Admins can delete" ON articles
+    FOR DELETE USING (auth.role() = 'admin');
+```
+
+-----
+
+# 13. CMS Y FLUJO EDITORIAL
+
+## Flujo de Contenido Completo
+
+```
+1. SOURCING → n8n monitorea fuentes RSS/APIs de journals médicos
+   ↓
+2. AI GENERATION → OpenAI genera resumen + traducción + keywords
+   ↓
+3. DRAFT → Artículo se crea en Supabase (status: draft)
+   ↓
+4. SYNC TO NOTION → n8n sincroniza a Notion Content Tracker
+   ↓
+5. EDITORIAL REVIEW → Editor humano revisa en Notion/Strapi
+   ↓
+6. APPROVAL → Editor cambia status a "approved"
+   ↓
+7. MEDIA GENERATION → n8n dispara:
+   • DALL-E 3 genera cover art (flor del mes + color del día)
+   • ElevenLabs genera audio del artículo
+   ↓
+8. PUBLICATION → n8n publica en el frontend (status: published)
+   ↓
+9. DISTRIBUTION → n8n distribuye a:
+   • X/Twitter (social card)
+   • Newsletter (GoHighLevel)
+   • RSS Feed
+   ↓
+10. MONITORING → Analytics tracean engagement y feedback
+```
+
+## Strapi CMS Configuration
+
+Strapi actúa como el CMS headless donde el equipo editorial puede:
+
+- Crear y editar artículos con editor visual rico
+- Gestionar categorías y tags
+- Programar publicaciones
+- Gestionar multimedia
+- Configurar workflows de aprobación
+
+-----
+
+# 14. AUTOMATIZACIÓN CON N8N
+
+## Workflows Principales
+
+### Workflow 1: Content Sync (Supabase → Notion)
+
+- Trigger: New/Updated Row en tabla articles
+- Action: Create/Update Page en Notion Content Tracker
+- Mapping: title → Title, summary → Summary, category_id → Category, status → Status
+
+### Workflow 2: Content Generation (Scheduled)
+
+- Trigger: Cron (diario)
+- Actions:
+  1. HTTP Request a fuentes RSS de journals médicos
+  1. OpenAI API para generar resumen + traducción
+  1. Insert en Supabase tabla articles (status: draft)
+  1. Notion sync automático
+
+### Workflow 3: Media Generation (On Approval)
+
+- Trigger: Article status cambia a "approved"
+- Actions:
+  1. DALL-E 3: Genera cover art con prompt que incluye flor del mes + color del día
+  1. ElevenLabs: Genera audio del resumen del artículo
+  1. Update article con URLs de media
+  1. Cambiar status a "published"
+
+### Workflow 4: Social Distribution (On Publish)
+
+- Trigger: Article status cambia a "published"
+- Actions:
+  1. Generar social card optimizada para X/Twitter
+  1. Publicar en X vía API
+  1. Agregar a newsletter queue en GoHighLevel
+  1. Notificar equipo vía Slack/Email
+
+### Workflow 5: Feedback Integration (Supabase → Notion)
+
+- Trigger: New Row en tabla feedback
+- Action: Create Page en Notion Feedback Management
+
+### Workflow 6: Weekly Analytics Report
+
+- Trigger: Cron (cada lunes)
+- Actions:
+  1. Query Supabase para métricas de la semana
+  1. Generar reporte con OpenAI
+  1. Enviar a Notion y por email al equipo
+
+## Docker Setup para n8n
+
+```yaml
+# docker-compose.yml
+n8n:
+  image: n8nio/n8n
+  ports:
+    - "5678:5678"
+  environment:
+    - N8N_BASIC_AUTH_ACTIVE=true
+    - N8N_BASIC_AUTH_USER=admin
+    - N8N_BASIC_AUTH_PASSWORD=secure_password_here
+    - N8N_HOST=localhost
+    - N8N_PORT=5678
+    - N8N_PROTOCOL=http
+    - NODE_ENV=production
+  volumes:
+    - n8n_data:/root/.n8n
+```
+
+## Environment Variables Necesarias
+
+```bash
+# Supabase
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your-supabase-key
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+
+# OpenAI
+OPENAI_API_KEY=sk-your-openai-key
+
+# ElevenLabs
+ELEVENLABS_API_KEY=your-elevenlabs-key
+
+# Notion
+NOTION_TOKEN=your-notion-integration-token
+NOTION_CONTENT_DB_ID=your-content-tracker-db-id
+NOTION_FEEDBACK_DB_ID=your-feedback-db-id
+
+# Strapi
+STRAPI_URL=http://localhost:1337
+STRAPI_API_TOKEN=your-strapi-token
+
+# X/Twitter
+TWITTER_API_KEY=your-twitter-key
+TWITTER_API_SECRET=your-twitter-secret
+TWITTER_ACCESS_TOKEN=your-access-token
+TWITTER_ACCESS_SECRET=your-access-secret
+
+# GoHighLevel
+GHL_API_KEY=your-gohighlevel-key
+```
+
+-----
+
+# 15. INTEGRACIONES DE IA Y AUDIO
+
+## OpenAI — Generación de Contenido
+
+### Prompt de Generación de Artículos
+
+```
+Eres un experto médico redactando para Medica Noticia, una revista digital en español.
+
+Tu tarea es optimizar el siguiente artículo médico:
+
+FUENTE ORIGINAL: [URL/texto del artículo]
+
+INSTRUCCIONES:
+1. Genera un título conciso y atractivo (máximo 100 caracteres)
+2. Escribe un resumen de 150-450 palabras
+3. Desarrolla el contenido completo (1000-1500 palabras)
+4. El tono debe ser: [personalidad del día]
+5. Categoría: [una de las 5 categorías]
+6. Genera 5-8 palabras clave relevantes
+7. Escribe una meta descripción SEO (150-160 caracteres)
+8. Sugiere 2-3 artículos relacionados potenciales
+9. Todo en español, accesible tanto para profesionales de salud como público general
+10. Tono positivo, validado y esperanzador — NO alarmista
+
+FORMATO DE SALIDA: JSON estructurado
+```
+
+### Prompt de Cover Art (DALL-E 3)
+
+```
+Crea una imagen de portada para un artículo médico sobre '[TÍTULO]'.
+
+La imagen debe tener:
+- Estética limpia médica/salud con [COLOR DEL DÍA] como color dominante
+- Integración sutil y natural de flores de [FLOR DEL MES]
+- Estilo minimalista, moderno y profesional
+- Tono visual: [EMOCIÓN DEL DÍA]
+- NO texto superpuesto
+- Adecuada para profesionales de salud y público general
+- Transmite información médica de manera tranquilizadora y positiva
+- Incluye elementos orgánicos sutiles que sugieran salud y bienestar
+```
+
+## ElevenLabs — Audio
+
+Cada artículo publicado genera automáticamente una versión en audio usando ElevenLabs con el modelo eleven_multilingual_v2 para español natural.
+
+```json
+{
+  "model_id": "eleven_multilingual_v2",
+  "voice_settings": {
+    "stability": 0.75,
+    "similarity_boost": 0.75,
+    "style": 0.5,
+    "use_speaker_boost": true
+  }
+}
+```
+
+-----
+
+# 16. FRONTEND: DISEÑO Y UX
+
+## Principios de Diseño
+
+1. Minimalista — Sin anuncios, sin distracciones
+1. Artístico — El contenido se presenta como arte, no como noticias genéricas
+1. Accesible — WCAG 2.1 AA compliance mínimo
+1. Responsivo — Mobile-first design
+1. Rápido — Core Web Vitals óptimos gracias a Next.js SSR/SSG
+
+## Paleta de Colores por Día
+
+```css
+:root {
+  --monday: #87CEEB;    /* Azul Celeste */
+  --tuesday: #FFD700;   /* Amarillo */
+  --wednesday: #00CC00;  /* Verde */
+  --thursday: #FF8C00;   /* Naranja */
+  --friday: #FF0000;     /* Rojo */
+  --saturday: #800080;   /* Morado */
+  --sunday: #FFFFFF;     /* Blanco */
+  --primary: #1a1a2e;    /* Dark background */
+  --accent: #FF6B35;     /* Orange accent */
+  --text: #EEEEEE;       /* Light text */
+}
+```
+
+## Páginas Principales
+
+| Ruta | Página | Descripción |
+|------|--------|-------------|
+| `/` | Home | Artículos destacados del día con color del día |
+| `/articulos` | Feed de artículos | Grid filtrable por categoría/día/fecha |
+| `/articulo/[slug]` | Detalle de artículo | Artículo completo con audio player |
+| `/categorias` | Categorías | Vista de las 5 categorías |
+| `/categoria/[slug]` | Artículos por categoría | Feed filtrado |
+| `/nuestrasfuentes` | Fuentes | Todas las fuentes por continente |
+| `/transparencia` | Transparencia | Política de transparencia |
+| `/buscar` | Búsqueda | Búsqueda avanzada con Elasticsearch |
+| `/perfil` | Perfil de usuario | Favoritos, historial, preferencias |
+| `/sobre-nosotros` | About | Misión, visión, equipo |
+
+## Componentes Clave
+
+- **ArticleCard** — Card de artículo con cover art, título, resumen, audio toggle
+- **DailyHeader** — Banner dinámico con color y temática del día
+- **AudioPlayer** — Player persistente para escuchar artículos
+- **SourceBadge** — Badge que muestra la fuente con link a transparencia
+- **CategoryFilter** — Filtro visual por las 5 categorías
+- **SearchBar** — Búsqueda con autocompletado semántico
+- **FlowerOfTheDay** — Indicador visual de la flor del día
+- **ChatBot** — Asistente interactivo flotante
+
+-----
+
+# 17. SEO Y METADATA
+
+## Estrategia SEO
+
+### On-Page
+
+- Meta descriptions optimizadas (150-160 chars) por artículo
+- Structured data (Schema.org) para artículos médicos
+- URLs amigables: /articulo/titulo-del-articulo
+- Sitemap XML generado automáticamente por Next.js
+- Open Graph y Twitter Cards para compartir en redes
+- Canonical URLs para evitar contenido duplicado
+- Alt text en todas las imágenes
+
+### Técnico
+
+- SSR/SSG con Next.js para crawlability perfecta
+- Core Web Vitals optimizados (LCP < 2.5s, FID < 100ms, CLS < 0.1)
+- Lazy loading de imágenes y componentes
+- robots.txt y meta robots configurados correctamente
+
+### Contenido
+
+- 3-5 artículos por semana consistentemente
+- Keywords por categoría optimizados para intención de búsqueda médica
+- Internal linking entre artículos relacionados
+- Evergreen content marcado para re-promoción
+
+-----
+
+# 18. SISTEMA MULTI-AGENTE (MAS)
+
+El proyecto implementa un sistema jerárquico estilo Crew.ai con agentes especializados.
+
+## Agentes Disponibles
+
+### 1. Project Manager (PM)
+- Rol: Supervisión general del proyecto
+- Meta: Coordinación, timelines, recursos, mitigación de riesgos
+- Herramientas: Notion, ClickUp, n8n dashboards
+
+### 2. Technical Architect (TA)
+- Rol: Decisiones técnicas y arquitectura
+- Meta: Sistemas escalables, integrados, mejores prácticas
+- Herramientas: GitHub, Docker, Supabase, Vercel
+
+### 3. UI/UX Specialist (UX)
+- Rol: Diseño de interfaz y experiencia
+- Meta: Diseños user-friendly, accesibles, atractivos
+- Herramientas: Figma, Next.js, Tailwind
+
+### 4. Content Curator (CC)
+- Rol: Estrategia y curación de contenido
+- Meta: Calidad, relevancia, SEO optimizado
+- Herramientas: Strapi, OpenAI, fuentes médicas
+
+### 5. AI Integration Expert (AI)
+- Rol: Integración de IA y ML
+- Meta: Chatbot, NLP, generación de contenido por IA
+- Herramientas: OpenAI API, ElevenLabs, n8n
+
+### 6. Data Scientist (DS)
+- Rol: Modelado y análisis de datos
+- Meta: Insights de comportamiento, personalización
+- Herramientas: Supabase, Neo4j, Analytics
+
+### 7. Security Specialist (SS)
+- Rol: Privacidad y seguridad
+- Meta: Compliance GDPR, auditorías, protección de datos
+- Herramientas: Supabase RLS, RBAC
+
+### 8. Performance Optimizer (PO)
+- Rol: Rendimiento y optimización
+- Meta: Velocidad, caching, eficiencia
+- Herramientas: Vercel Analytics, Sentry, Lighthouse
+
+## Modelo Jerárquico
+
+```
+NIVEL EJECUTIVO
+├── Chief Operations Agent (COA) — Supervisión, KPIs, presupuesto
+└── Chief Technology Agent (CTA) — Infraestructura, IA, escalabilidad
+
+NIVEL GERENCIAL
+├── Full-Stack Dev Manager (FSMA) — Equipo de desarrollo
+├── Marketing Manager (MMA) — Estrategia de marketing
+└── Content Manager (CMA) — Curación y calidad editorial
+
+NIVEL OPERATIVO
+├── Development Agents — Frontend, backend, AI integration
+├── Marketing Agents — SEO, social media, ads
+├── Content Agents — Redacción, edición, curación
+└── Support Agents — Soporte técnico, usuarios
+```
+
+-----
+
+# 19. PLAN DE MARKETING
+
+## Análisis FODA
+
+| | Positivo | Negativo |
+|---|----------|----------|
+| **Interno** | **Fortalezas:** Contenido curado y positivo, sin anuncios, accesibilidad gratuita, fuentes de alta calidad, formato visualmente atractivo | **Debilidades:** Dependencia de fuentes externas, recursos limitados para contenido original, necesidad de actualización tecnológica constante |
+| **Externo** | **Oportunidades:** Demanda creciente de noticias veraces, expansión en mercados hispanohablantes, integración de nuevas tecnologías IA, contenido audiovisual | **Amenazas:** Competencia con medios tradicionales y digitales, cambios en algoritmos de distribución, desafíos de monetización a largo plazo |
+
+## Estrategia de Canales
+
+1. SEO Orgánico — Posicionamiento en Google para keywords médicas en español
+1. Redes Sociales — X (Twitter), Instagram, LinkedIn, Facebook
+1. Email Marketing — Newsletter semanal vía GoHighLevel
+1. Programa de Referidos — Incentivos para usuarios que recomienden
+1. Influencer Partnerships — Colaboraciones con médicos influencers
+1. Content Marketing — Blog + artículos de alta calidad como herramienta de adquisición
+
+## KPIs de Marketing
+
+- Usuarios Activos Mensuales (MAU)
+- Tasa de Crecimiento de Suscriptores
+- Engagement (Tiempo en Plataforma, Artículos Leídos, Interacciones)
+- Tasa de Producción de Contenido
+- Customer Satisfaction Score (CSAT)
+
+-----
+
+# 20. PLAN FINANCIERO
+
+## Objetivos Financieros
+
+| Año | Revenue | Net Profit |
+|-----|---------|------------|
+| **Año 1** | $500,000 | $100,000 |
+| **Año 3** | $5,000,000 | $1,500,000 |
+| **Año 5** | $15,000,000 | $5,000,000 |
+
+## Asignación de Presupuesto (Año 1: $500K)
+
+| Categoría | % | Monto |
+|-----------|---|-------|
+| Desarrollo Tecnológico y AI | 40% | $200,000 |
+| Curación y Optimización de Contenido | 30% | $150,000 |
+| Marketing y Adquisición de Usuarios | 20% | $100,000 |
+| Gastos Operativos | 10% | $50,000 |
+
+## Revenue Streams
+
+1. Premium Subscriptions — Contenido exclusivo, sin limits
+1. Institutional Licenses — Hospitales, universidades, clínicas
+1. Sponsored Content — Contenido patrocinado (claramente marcado)
+1. Data Analytics Services — Insights para healthcare providers (futuro)
+1. Virtual Events/Webinars — Eventos con expertos médicos (Año 3+)
+1. Enterprise API — Acceso a datos curados para terceros (Año 3+)
+
+-----
+
+# 21. ROADMAP DE DESARROLLO POR FASES
+
+## Fase 1: MVP Launch (Meses 1-6)
+
+### Mes 1-2: Fundamentos
+
+- [ ] Configurar Supabase: proyecto, tablas, auth, RLS
+- [ ] Setup Next.js + Tailwind CSS + shadcn/ui
+- [ ] Crear esquema de base de datos completo
+- [ ] Configurar Docker + n8n
+- [ ] Setup repositorio GitHub con CI/CD a Vercel
+- [ ] Diseñar wireframes y mockups en Figma
+
+### Mes 3-4: Core Development
+
+- [ ] Desarrollar frontend: Home, ArticleDetail, Categories, Search
+- [ ] Integrar Supabase auth y data fetching
+- [ ] Configurar Strapi CMS headless
+- [ ] Primer workflow n8n: Content sync Supabase → Notion
+- [ ] Integrar OpenAI API para generación de contenido
+- [ ] Implementar sistema de colores por día
+
+### Mes 5: Integraciones
+
+- [ ] Integrar ElevenLabs para audio de artículos
+- [ ] Integrar DALL-E 3 para cover art con sistema floral
+- [ ] Workflow n8n: Social distribution a X/Twitter
+- [ ] Configurar GoHighLevel para newsletter
+- [ ] Implementar búsqueda básica con Supabase full-text search
+
+### Mes 6: Testing y Launch
+
+- [ ] QA completo: unit tests, integration tests, UAT
+- [ ] Cargar contenido inicial: 30-50 artículos
+- [ ] Optimización de performance (Core Web Vitals)
+- [ ] SEO setup: sitemap, robots, structured data
+- [ ] Beta launch con grupo selecto de usuarios
+- [ ] Iteración basada en feedback
+
+## Fase 2: Growth (Meses 7-12)
+
+- [ ] Mobile app (React Native)
+- [ ] Chatbot interactivo con Dialogflow/Rasa
+- [ ] Elasticsearch para búsqueda avanzada
+- [ ] Programa de referidos
+- [ ] Partnerships con influencers médicos
+- [ ] Sistema de suscripción premium
+
+## Fase 3: AI Enhancement (Año 2)
+
+- [ ] Contenido en inglés
+- [ ] Neo4j AuraDB para relaciones complejas (GraphRAG)
+- [ ] Vector database para búsqueda semántica
+- [ ] Personalización avanzada por usuario
+- [ ] Data analytics dashboard
+
+## Fase 4: Scale (Años 3-5)
+
+- [ ] Diversificación de contenido (video, podcasts)
+- [ ] Virtual events y webinars
+- [ ] Enterprise API y soluciones B2B
+- [ ] Expansión a más idiomas
+
+-----
+
+# 22. ASIGNACIÓN DE ROLES PARA LOS 5 AGENTES
+
+## Distribución Recomendada
+
+### AGENTE 1: Full-Stack Developer (Lead)
+
+**Responsabilidad principal:** Frontend + Backend core
+
+**Tareas:**
+- Setup y mantenimiento de Next.js + Tailwind + shadcn/ui
+- Integración con Supabase (auth, queries, real-time)
+- Desarrollo de todas las páginas y componentes
+- API layer (GraphQL/REST)
+- Deployment en Vercel con CI/CD
+- Performance optimization
+
+**Stack que debe dominar:** React, Next.js, TypeScript, Tailwind CSS, Supabase, GraphQL
+
+-----
+
+### AGENTE 2: Backend & Database Engineer
+
+**Responsabilidad principal:** Infraestructura de datos + Seguridad
+
+**Tareas:**
+- Diseño e implementación del esquema de Supabase (PostgreSQL)
+- Configuración de RLS, RBAC, políticas de seguridad
+- Setup y configuración de Strapi CMS
+- Docker configuration para todos los servicios
+- Configuración de Elasticsearch (Fase 2)
+- Neo4j AuraDB setup (Fase 3)
+- Backups, monitoreo, escalabilidad
+
+**Stack que debe dominar:** PostgreSQL, Supabase, Docker, Strapi, Node.js, SQL
+
+-----
+
+### AGENTE 3: Automation & AI Engineer
+
+**Responsabilidad principal:** n8n workflows + Integraciones de IA
+
+**Tareas:**
+- Setup y configuración de n8n (Docker)
+- Desarrollo de TODOS los workflows automatizados (6+ workflows)
+- Integración con OpenAI API (generación de contenido)
+- Integración con DALL-E 3 (cover art)
+- Integración con ElevenLabs (audio)
+- Integración con GoHighLevel, Notion, Google Drive, Airtable
+- Social media automation (X/Twitter API)
+- Chatbot development (Fase 2)
+
+**Stack que debe dominar:** n8n, REST APIs, OpenAI API, Docker, Node.js, JSON
+
+-----
+
+### AGENTE 4: Content Curator & SEO Specialist
+
+**Responsabilidad principal:** Contenido editorial + SEO + Marketing
+
+**Tareas:**
+- Curación diaria de contenido de las 19+ fuentes internacionales
+- Revisión y edición de artículos generados por IA
+- Implementación del sistema de personalidad semanal
+- Aplicación del sistema floral mensual
+- SEO on-page: meta descriptions, keywords, structured data
+- Estrategia de contenido y calendario editorial
+- Gestión de redes sociales y newsletter
+- Tracking de KPIs de marketing
+
+**Skills que debe dominar:** Escritura médica, SEO, español impecable, marketing digital, Strapi CMS
+
+-----
+
+### AGENTE 5: UI/UX Designer & QA
+
+**Responsabilidad principal:** Diseño visual + Testing + Quality Assurance
+
+**Tareas:**
+- Diseño de todas las interfaces en Figma
+- Implementación de la paleta de colores por día
+- Design system con componentes reutilizables
+- Sistema visual floral para cover art
+- Responsive design testing (mobile-first)
+- WCAG 2.1 AA accessibility compliance
+- QA: unit testing, integration testing, UAT
+- Bug tracking y regression testing
+- Documentation de componentes
+
+**Skills que debe dominar:** Figma, UI/UX design, Tailwind CSS, testing frameworks, accesibilidad
+
+-----
+
+# 23. RIESGOS Y MITIGACIÓN
+
+| Riesgo | Impacto | Probabilidad | Estrategia de Mitigación |
+|--------|---------|--------------|--------------------------|
+| Baja adopción de usuarios | Alto | Medio | Marketing agresivo, engagement comunitario, feedback constante |
+| Problemas técnicos | Alto | Bajo | QA riguroso, equipo de soporte responsivo, monitoring |
+| Compromiso de calidad de contenido | Alto | Bajo | Curadores calificados, guidelines editoriales estrictas, human-in-the-loop |
+| Fallas en algoritmos de IA | Medio | Medio | Entrenamiento continuo, feedback integration, supervisión humana |
+| No-compliance regulatorio | Alto | Bajo | Expertise legal, auditorías regulares de compliance |
+| Competencia de mercado | Medio | Alto | Propuesta de valor única, innovación continua |
+| Shortfalls financieros | Alto | Medio | Fuentes diversas de funding, reservas financieras |
+
+-----
+
+# 24. CHECKLIST DE LANZAMIENTO MVP
+
+## Pre-Launch (2 semanas antes)
+
+- [ ] Todos los servicios configurados y funcionando (Supabase, Strapi, n8n, Vercel)
+- [ ] Mínimo 30 artículos publicados cubriendo las 5 categorías
+- [ ] Audio generado para al menos 10 artículos
+- [ ] Cover art generado para todos los artículos
+- [ ] Sistema de colores por día funcionando correctamente
+- [ ] Auth flow completo (registro, login, perfil)
+- [ ] Búsqueda funcionando
+- [ ] Mobile responsive verificado en 3+ dispositivos
+- [ ] SEO basics: sitemap, robots.txt, meta tags, Open Graph
+- [ ] SSL certificado activo
+- [ ] Google Analytics / Sentry configurados
+- [ ] Pruebas de carga realizadas
+- [ ] Backup automático configurado en Supabase
+
+## Launch Day
+
+- [ ] DNS apuntando correctamente a Vercel
+- [ ] n8n workflows activados (content sync, social distribution)
+- [ ] Newsletter de lanzamiento preparada en GoHighLevel
+- [ ] Posts de lanzamiento programados en X/Twitter
+- [ ] Equipo en stand-by para monitorear y resolver issues
+- [ ] Notificar a beta testers del launch público
+
+## Post-Launch (primeras 2 semanas)
+
+- [ ] Monitorear métricas diariamente (traffic, engagement, errors)
+- [ ] Responder feedback de usuarios dentro de 24 horas
+- [ ] Publicar mínimo 3 artículos por semana
+- [ ] Revisar y optimizar workflows de n8n
+- [ ] Primera retrospectiva de equipo
+- [ ] Ajustar prioridades basado en datos reales
+
+-----
+
+# 25. APÉNDICES Y REFERENCIAS TÉCNICAS
+
+## A. Notion Databases Necesarias
+
+1. Content Tracker — Title, Summary, Category, Status, Publication Date, Author
+1. Project Management — Project Name, Status, Deadlines, Assigned Team Members
+1. Feedback Management — Feedback ID, Article ID, User ID, Comment, Rating, Date
+
+## B. API Keys Necesarias (obtener antes de empezar)
+
+1. Supabase (URL + Anon Key + Service Role Key)
+1. OpenAI (API Key)
+1. ElevenLabs (API Key)
+1. Notion (Internal Integration Token)
+1. X/Twitter (API Key, Secret, Access Token)
+1. GoHighLevel (API Key)
+1. Google (Analytics ID, Drive API credentials)
+1. Vercel (Account + Team setup)
+1. GitHub (Organization + repo setup)
+
+## C. Docker Services
+
+```yaml
+version: '3'
+services:
+  n8n:
+    image: n8nio/n8n
+    ports: ["5678:5678"]
+    volumes: [n8n_data:/root/.n8n]
+  strapi:
+    image: strapi/strapi
+    ports: ["1337:1337"]
+    volumes: [strapi_data:/srv/app]
+    depends_on: [supabase]
+  frontend:
+    build: ./frontend
+    ports: ["3000:3000"]
+
+volumes:
+  n8n_data:
+  strapi_data:
+```
+
+## D. Modelo de GraphRAG (Neo4j) — Fase 3
+
+```
+Nodos: Article, Author, Category, Tag, Theme, Source, Edition
+
+Relaciones:
+(Article)-[:WRITTEN_BY]->(Author)
+(Article)-[:BELONGS_TO]->(Category)
+(Article)-[:TAGGED_WITH]->(Tag)
+(Article)-[:COVERS_THEME]->(Theme)
+(Article)-[:SOURCED_FROM]->(Source)
+(Author)-[:SPECIALIZES_IN]->(Theme)
+(Theme)-[:RELATED_TO]->(Theme)
+```
+
+## E. Contactos Clave
+
+- Dominio: www.medicanoticia.com
+- Hosting: Vercel
+- Database: Supabase
+- CMS: Strapi
+- Automation: n8n
+- CRM: GoHighLevel
+
+-----
+
+## NOTA FINAL PARA EL EQUIPO
+
+Este documento contiene todo lo necesario para construir Medica Noticia desde cero. Cada sección está diseñada para ser actionable — no es teoría, es un plan de ejecución.
+
+**Prioridades inmediatas:**
+
+1. Agente 2: Setup Supabase + Docker + esquema de DB
+1. Agente 1: Setup Next.js + Tailwind + Vercel + Supabase client
+1. Agente 5: Wireframes en Figma + Design system
+1. Agente 3: Setup n8n + primer workflow (content sync)
+1. Agente 4: Curar primeros 30 artículos + setup calendario editorial
+
+El objetivo es tener un MVP funcional en 6 meses. Cada sprint de 2 semanas debe producir incrementos demostrables.
+
+¡Vamos a construir la principal fuente de información médica en español! 🚀
+
+-----
+
+*Documento generado a partir del Knowledge Base completo del proyecto Medica Noticia.*
+*Versión 1.0 — Febrero 2026*
